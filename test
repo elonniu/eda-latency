@@ -1,0 +1,285 @@
+#!/bin/sh
+
+error() {
+  echo "error: $1"
+  exit 1
+}
+
+ifError() {
+  if [ $1 != 0 ]; then
+    echo ""
+    exit 1
+  fi
+}
+
+groups=5
+sleep=5
+stage=prod
+batch=1
+name=eda-latency
+clear=false
+
+getApi() {
+  api=$(aws apigatewayv2 get-apis --query "Items[?Name=='$stage-$name-$1-api'].ApiEndpoint" --output text)
+  ifError $?
+  function="$stage-$name-$1-trigger"
+  apiFunction="$stage-$name-$1-api"
+  clearFunction="$stage-$name-$1-clear"
+}
+
+getPc() {
+  fn=$(aws lambda list-provisioned-concurrency-configs --function-name $function)
+  ifError $?
+  VERSION=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].FunctionArn' | sed 's/"//g' | rev | cut -d: -f1 | rev)
+  RequestedProvisionedConcurrentExecutions=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].RequestedProvisionedConcurrentExecutions')
+  AvailableProvisionedConcurrentExecutions=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].AvailableProvisionedConcurrentExecutions')
+  AllocatedProvisionedConcurrentExecutions=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].AllocatedProvisionedConcurrentExecutions')
+  fn=$(aws lambda list-provisioned-concurrency-configs --function-name $apiFunction)
+  ifError $?
+  API_VERSION=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].FunctionArn' | sed 's/"//g' | rev | cut -d: -f1 | rev)
+  API_RequestedProvisionedConcurrentExecutions=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].RequestedProvisionedConcurrentExecutions')
+  API_AvailableProvisionedConcurrentExecutions=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].AvailableProvisionedConcurrentExecutions')
+  API_AllocatedProvisionedConcurrentExecutions=$(echo $fn | jq '.ProvisionedConcurrencyConfigs[0].AllocatedProvisionedConcurrentExecutions')
+}
+
+getClient() {
+  CLIENT="pc$AvailableProvisionedConcurrentExecutions-bw$MaximumBatchingWindowInSeconds-bs$BatchSize-pf$ParallelizationFactor-ra$MaximumRecordAgeInSeconds-n$n-c$c-g$groups"
+}
+
+getConfig() {
+  mappings=$(aws lambda list-event-source-mappings --function-name "$function:$VERSION" --output json)
+  ifError $?
+  #  echo $mappings | jq '.'
+  UUID=$(echo $mappings | jq '.EventSourceMappings[0].UUID' | sed 's/"//g')
+  BatchSize=$(echo $mappings | jq '.EventSourceMappings[0].BatchSize')
+  ParallelizationFactor=$(echo $mappings | jq '.EventSourceMappings[0].ParallelizationFactor')
+  MaximumBatchingWindowInSeconds=$(echo $mappings | jq '.EventSourceMappings[0].MaximumBatchingWindowInSeconds')
+  MaximumRecordAgeInSeconds=$(echo $mappings | jq '.EventSourceMappings[0].MaximumRecordAgeInSeconds')
+  TumblingWindowInSeconds=$(echo $mappings | jq '.EventSourceMappings[0].TumblingWindowInSeconds')
+  if [ "$TumblingWindowInSeconds" == "null" ]; then
+    TumblingWindowInSeconds=0
+  fi
+  getClient
+}
+
+printConfig() {
+  echo ""
+  echo "------------------------$1------------------------"
+  echo "AB n                               $n "
+  echo "AB c                               $c "
+  echo "AB groups                          $groups "
+  echo "AB Client                          $CLIENT "
+  echo "............"
+  echo "Api URL                            $api "
+  echo "API Function                       $apiFunction "
+  echo "API Version                        $API_VERSION "
+  echo "API RequestedProvisionedConcurrent $API_RequestedProvisionedConcurrentExecutions "
+  echo "API AvailableProvisionedConcurrent $API_AvailableProvisionedConcurrentExecutions "
+  echo "API AllocatedProvisionedConcurrent $API_AllocatedProvisionedConcurrentExecutions "
+  echo "............"
+  echo "ESM Function                       $function "
+  echo "ESM Version                        $VERSION "
+  echo "ESM RequestedProvisionedConcurrent $RequestedProvisionedConcurrentExecutions "
+  echo "ESM AvailableProvisionedConcurrent $AvailableProvisionedConcurrentExecutions "
+  echo "ESM AllocatedProvisionedConcurrent $AllocatedProvisionedConcurrentExecutions "
+  echo "............"
+  echo "ESM BatchSize                      $BatchSize "
+  echo "ESM MaximumBatchingWindowInSeconds $MaximumBatchingWindowInSeconds "
+  echo "ESM ParallelizationFactor          $ParallelizationFactor "
+  echo "ESM MaximumRecordAgeInSeconds      $MaximumRecordAgeInSeconds "
+  echo "ESM TumblingWindowInSeconds        $TumblingWindowInSeconds "
+  echo "------------------------$1------------------------"
+  echo ""
+}
+
+for ARGUMENT in "$@"; do
+  KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+  KEY_LENGTH=${#KEY}
+  VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+  if [ "$KEY" == 'n' ]; then
+    n=$VALUE
+  fi
+
+  if [ "$KEY" == 'c' ]; then
+    c=$VALUE
+  fi
+
+  if [ "$KEY" == 'service' ]; then
+    service=$VALUE
+  fi
+
+  if [ "$KEY" == 'stage' ]; then
+    stage=$VALUE
+  fi
+
+  if [ "$KEY" == 'batch' ]; then
+    batch=$VALUE
+  fi
+
+  if [ "$KEY" == 'clear' ]; then
+    clear=$VALUE
+  fi
+
+done
+
+if [ -z "$service" ]; then
+  echo "\$service must be set"
+  exit 1
+fi
+
+if [ -z "$n" ]; then
+  echo "\$n must be set"
+  exit 1
+fi
+
+if [ -z "$c" ]; then
+  echo "\$c must be set"
+  exit 1
+fi
+
+getApi "$service"
+getPc
+getConfig
+printConfig "update before"
+
+for ARGUMENT in "$@"; do
+  KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+  KEY_LENGTH=${#KEY}
+  VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+  if [ "$KEY" == 'pc' ]; then
+    ProvisionedConcurrency=$VALUE
+  else
+    ProvisionedConcurrency=$AvailableProvisionedConcurrentExecutions
+  fi
+
+  if [ "$KEY" == 'apc' ]; then
+    API_ProvisionedConcurrency=$VALUE
+  else
+    API_ProvisionedConcurrency=$API_AvailableProvisionedConcurrentExecutions
+  fi
+
+  if [ "$KEY" == 'groups' ]; then
+    groups=$VALUE
+  fi
+
+  if [ "$KEY" == 'bs' ]; then
+    BatchSize=$VALUE
+  fi
+
+  if [ "$KEY" == 'pf' ]; then
+    ParallelizationFactor=$VALUE
+  fi
+
+  if [ "$KEY" == 'bw' ]; then
+    MaximumBatchingWindowInSeconds=$VALUE
+  fi
+
+  if [ "$KEY" == 'mra' ]; then
+    MaximumRecordAgeInSeconds=$VALUE
+  fi
+
+  if [ "$KEY" == 'tw' ]; then
+    TumblingWindowInSeconds=$VALUE
+  fi
+
+  if [ "$KEY" == 'sleep' ]; then
+    sleep=$VALUE
+  fi
+
+done
+
+if [ $clear == "true" ]; then
+  echo "clear before request..."
+  for (( ; ; )); do
+    hidden=$(aws lambda invoke --function-name $clearFunction /tmp/output.json)
+    ifError $?
+    left=$(cat /tmp/output.json)
+    if [ $left == "0" ]; then
+      break
+    else
+      echo "deleted $left items"
+    fi
+  done
+  exit 0
+fi
+
+update_esm=$(aws lambda update-event-source-mapping --function-name "$function:$VERSION" \
+  --uuid $UUID \
+  --batch-size $BatchSize \
+  --maximum-batching-window-in-seconds $MaximumBatchingWindowInSeconds \
+  --maximum-record-age-in-seconds $MaximumRecordAgeInSeconds \
+  --parallelization-factor $ParallelizationFactor \
+  --output json)
+ifError $?
+
+if [ "$API_ProvisionedConcurrency" != "$API_AvailableProvisionedConcurrentExecutions" ]; then
+  echo "Updating API Provisioned Concurrency to $API_ProvisionedConcurrency from $API_AvailableProvisionedConcurrentExecutions"
+  update_pc=$(aws lambda put-provisioned-concurrency-config \
+    --function-name "$apiFunction" \
+    --qualifier "$API_VERSION" \
+    --provisioned-concurrent-executions "$API_ProvisionedConcurrency" \
+    --output json)
+  ifError $?
+  for (( ; ; )); do
+    getPc
+    if [ "$API_ProvisionedConcurrency" == "$API_AvailableProvisionedConcurrentExecutions" ]; then
+      break
+    else
+      echo "API Provisioned Concurrency $API_AvailableProvisionedConcurrentExecutions != $API_ProvisionedConcurrency , waiting..."
+      sleep 2
+    fi
+  done
+fi
+
+if [ "$ProvisionedConcurrency" != "$AvailableProvisionedConcurrentExecutions" ]; then
+  echo "Updating Trigger Provisioned Concurrency to $ProvisionedConcurrency from $AvailableProvisionedConcurrentExecutions"
+  update_pc=$(aws lambda put-provisioned-concurrency-config \
+    --function-name "$function" \
+    --qualifier "$VERSION" \
+    --provisioned-concurrent-executions $ProvisionedConcurrency \
+    --output json)
+  ifError $?
+  for (( ; ; )); do
+    getPc
+    if [ "$ProvisionedConcurrency" == "$AvailableProvisionedConcurrentExecutions" ]; then
+      break
+    else
+      echo "Trigger Provisioned Concurrency $AvailableProvisionedConcurrentExecutions != $ProvisionedConcurrency , waiting..."
+      sleep 2
+    fi
+  done
+fi
+
+getConfig
+printConfig "update after"
+
+group=0
+
+for (( ; ; )); do
+
+  group=$(($group + 1))
+
+  if [ $group != 1 ]; then
+    echo ""
+    echo "$group/$groups sleep $sleep seconds ..."
+    sleep $sleep
+  fi
+
+  request_at_ms=$(time python -c "import time; print(int(time.time()*1000))")
+
+  ab -n$n -c$c "$api/?request_at_ms=$request_at_ms&batch=$batch&client=$CLIENT-$group"
+  ifError $?
+
+  if [ $group == $groups ]; then
+    break
+  fi
+
+done
+
+printConfig "ab after"
+
+# ./test service=ddb n=10 c=1 stage=dev clear=true groups=2 sleep=1 bs=50 bw=1 pf=10
